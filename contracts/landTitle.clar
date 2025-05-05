@@ -274,3 +274,98 @@
     )
   )
 )
+
+
+(define-map title-history
+  uint 
+  (list 50 {
+    timestamp: uint,
+    action: (string-ascii 12),
+    from: principal,
+    to: (optional principal),
+    price: uint
+  })
+)
+
+(define-read-only (get-title-history (title-id uint))
+  (match (map-get? title-history title-id)
+    history (ok history)
+    (ok (list))
+  )
+)
+
+(define-private (record-title-event 
+    (title-id uint)
+    (action (string-ascii 12))
+    (from principal)
+    (to (optional principal))
+    (price uint)
+  )
+  (let
+    ((current-history (default-to (list) (map-get? title-history title-id))))
+    (map-set title-history title-id
+      (unwrap-panic (as-max-len?
+        (append current-history {
+          timestamp: stacks-block-height,
+          action: action,
+          from: from,
+          to: to,
+          price: price
+        })
+        u50)))
+    true
+  )
+)
+
+
+
+(define-public (get-title-verification-status (title-id uint))
+  (match (map-get? title-registry title-id)
+    title-data (ok (get verified title-data))
+    err-not-found
+  )
+)
+
+
+(define-map title-liens
+  uint
+  (list 10 {
+    lender: principal,
+    amount: uint,
+    start-date: uint,
+    end-date: uint,
+    active: bool
+  })
+)
+
+(define-read-only (get-title-liens (title-id uint))
+  (match (map-get? title-liens title-id)
+    liens (ok liens)
+    (ok (list))
+  )
+)
+
+(define-public (register-lien 
+    (title-id uint)
+    (amount uint)
+    (end-date uint)
+  )
+  (let
+    ((title-data (unwrap! (map-get? title-registry title-id) err-not-found))
+     (current-liens (default-to (list) (map-get? title-liens title-id))))
+    
+    (asserts! (is-verification-authority tx-sender) err-unauthorized)
+    
+    (map-set title-liens title-id
+      (unwrap-panic (as-max-len?
+        (append current-liens {
+          lender: tx-sender,
+          amount: amount,
+          start-date: stacks-block-height,
+          end-date: end-date,
+          active: true
+        })
+        u10)))
+    (ok true)
+  )
+)
