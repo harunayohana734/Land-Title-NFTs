@@ -31,6 +31,41 @@
   }
 )
 
+
+
+(define-constant err-escrow-not-found (err u201))
+(define-constant err-invalid-amount (err u202))
+(define-constant err-escrow-expired (err u203))
+(define-constant err-escrow-not-active (err u204))
+(define-constant err-insufficient-funds (err u205))
+(define-constant err-title-not-for-sale (err u206))
+
+(define-data-var next-escrow-id uint u1)
+
+(define-map escrow-agreements
+  uint
+  {
+    buyer: principal,
+    seller: principal,
+    title-id: uint,
+    amount: uint,
+    deposit-date: uint,
+    expiry-date: uint,
+    status: (string-ascii 10),
+    land-title-contract: principal
+  }
+)
+
+(define-map buyer-escrows
+  principal
+  (list 20 uint)
+)
+
+(define-map seller-escrows
+  principal
+  (list 20 uint)
+)
+
 (define-map property-address-to-id
   (string-ascii 256)
   uint
@@ -367,5 +402,196 @@
         })
         u10)))
     (ok true)
+  )
+)
+
+
+(define-read-only (get-escrow-details (escrow-id uint))
+  (match (map-get? escrow-agreements escrow-id)
+    escrow-data (ok escrow-data)
+    err-escrow-not-found
+  )
+)
+
+(define-read-only (get-buyer-escrows (buyer principal))
+  (match (map-get? buyer-escrows buyer)
+    escrow-list (ok escrow-list)
+    (ok (list))
+  )
+)
+
+(define-read-only (get-seller-escrows (seller principal))
+  (match (map-get? seller-escrows seller)
+    escrow-list (ok escrow-list)
+    (ok (list))
+  )
+)
+
+(define-public (create-escrow 
+    (title-id uint)
+    (seller principal)
+    (amount uint)
+    (duration-blocks uint)
+    (land-title-contract principal)
+  )
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block duration-blocks))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrow-agreements escrow-id {
+      buyer: tx-sender,
+      seller: seller,
+      title-id: title-id,
+      amount: amount,
+      deposit-date: current-block,
+      expiry-date: expiry-block,
+      status: "active",
+      land-title-contract: land-title-contract
+    })
+    
+    (map-set buyer-escrows tx-sender
+      (unwrap-panic (as-max-len?
+        (append (default-to (list) (map-get? buyer-escrows tx-sender)) escrow-id)
+        u20)))
+    
+    (map-set seller-escrows seller
+      (unwrap-panic (as-max-len?
+        (append (default-to (list) (map-get? seller-escrows seller)) escrow-id)
+        u20)))
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (complete-escrow-transfer (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+      (buyer (get buyer escrow-data))
+      (seller (get seller escrow-data))
+      (title-id (get title-id escrow-data))
+      (amount (get amount escrow-data))
+      (status (get status escrow-data))
+      (land-title-contract (get land-title-contract escrow-data))
+    )
+    (asserts! (or (is-eq tx-sender buyer) (is-eq tx-sender seller)) err-unauthorized)
+    (asserts! (is-eq status "active") err-escrow-not-active)
+    (asserts! (<= stacks-block-height (get expiry-date escrow-data)) err-escrow-expired)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender seller)))
+    
+    (map-set escrow-agreements escrow-id
+      (merge escrow-data { status: "completed" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+      (buyer (get buyer escrow-data))
+      (amount (get amount escrow-data))
+      (status (get status escrow-data))
+    )
+    (asserts! (is-eq tx-sender buyer) err-unauthorized)
+    (asserts! (is-eq status "active") err-escrow-not-active)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender buyer)))
+    
+    (map-set escrow-agreements escrow-id
+      (merge escrow-data { status: "cancelled" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (refund-expired-escrow (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+      (buyer (get buyer escrow-data))
+      (amount (get amount escrow-data))
+      (status (get status escrow-data))
+      (expiry-date (get expiry-date escrow-data))
+    )
+    (asserts! (is-eq status "active") err-escrow-not-active)
+    (asserts! (> stacks-block-height expiry-date) err-escrow-expired)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender buyer)))
+    
+    (map-set escrow-agreements escrow-id
+      (merge escrow-data { status: "expired" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (dispute-escrow (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+      (buyer (get buyer escrow-data))
+      (seller (get seller escrow-data))
+      (status (get status escrow-data))
+    )
+    (asserts! (or (is-eq tx-sender buyer) (is-eq tx-sender seller)) err-unauthorized)
+    (asserts! (is-eq status "active") err-escrow-not-active)
+    
+    (map-set escrow-agreements escrow-id
+      (merge escrow-data { status: "disputed" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute 
+    (escrow-id uint)
+    (award-to-buyer bool)
+  )
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+      (buyer (get buyer escrow-data))
+      (seller (get seller escrow-data))
+      (amount (get amount escrow-data))
+      (status (get status escrow-data))
+      (recipient (if award-to-buyer buyer seller))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (asserts! (is-eq status "disputed") err-escrow-not-active)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    
+    (map-set escrow-agreements escrow-id
+      (merge escrow-data { status: "resolved" }))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow-balance (escrow-id uint))
+  (let
+    ((escrow-data (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+    (if (is-eq (get status escrow-data) "active")
+      (ok (get amount escrow-data))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (is-escrow-active (escrow-id uint))
+  (match (map-get? escrow-agreements escrow-id)
+    escrow-data (ok (is-eq (get status escrow-data) "active"))
+    err-escrow-not-found
   )
 )
