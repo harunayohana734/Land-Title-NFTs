@@ -15,6 +15,69 @@
 
 (define-data-var next-title-id uint u1)
 
+(define-constant err-rental-not-found (err u301))
+(define-constant err-rental-exists (err u302))
+(define-constant err-rental-not-active (err u303))
+(define-constant err-rental-expired (err u304))
+(define-constant err-not-tenant (err u305))
+(define-constant err-rent-paid (err u306))
+(define-constant err-rent-overdue (err u307))
+(define-constant err-property-not-rentable (err u308))
+(define-constant err-deposit-insufficient (err u309))
+
+(define-data-var next-rental-id uint u1)
+
+(define-map rental-agreements
+  uint
+  {
+    title-id: uint,
+    landlord: principal,
+    tenant: principal,
+    monthly-rent: uint,
+    security-deposit: uint,
+    start-date: uint,
+    end-date: uint,
+    next-payment-due: uint,
+    status: (string-ascii 12),
+    deposit-paid: bool,
+    last-payment-date: uint,
+    total-paid: uint,
+    late-fee: uint
+  }
+)
+
+(define-map landlord-rentals
+  principal
+  (list 20 uint)
+)
+
+(define-map tenant-rentals
+  principal
+  (list 10 uint)
+)
+
+(define-map title-rental-status
+  uint
+  {
+    is-rentable: bool,
+    current-rental-id: (optional uint),
+    monthly-rent: uint,
+    security-deposit: uint,
+    rental-terms: (string-ascii 256)
+  }
+)
+
+(define-map rental-payments
+  uint
+  (list 60 {
+    payment-date: uint,
+    amount: uint,
+    payment-type: (string-ascii 16),
+    period-start: uint,
+    period-end: uint
+  })
+)
+
 (define-map title-registry
   uint
   {
@@ -593,5 +656,290 @@
   (match (map-get? escrow-agreements escrow-id)
     escrow-data (ok (is-eq (get status escrow-data) "active"))
     err-escrow-not-found
+  )
+)
+
+
+(define-read-only (get-rental-details (rental-id uint))
+  (match (map-get? rental-agreements rental-id)
+    rental-data (ok rental-data)
+    err-rental-not-found
+  )
+)
+
+(define-read-only (get-title-rental-status (title-id uint))
+  (match (map-get? title-rental-status title-id)
+    rental-status (ok rental-status)
+    (ok {
+      is-rentable: false,
+      current-rental-id: none,
+      monthly-rent: u0,
+      security-deposit: u0,
+      rental-terms: ""
+    })
+  )
+)
+
+(define-read-only (get-landlord-rentals (landlord principal))
+  (match (map-get? landlord-rentals landlord)
+    rental-list (ok rental-list)
+    (ok (list))
+  )
+)
+
+(define-read-only (get-tenant-rentals (tenant principal))
+  (match (map-get? tenant-rentals tenant)
+    rental-list (ok rental-list)
+    (ok (list))
+  )
+)
+
+(define-read-only (get-rental-payment-history (rental-id uint))
+  (match (map-get? rental-payments rental-id)
+    payment-history (ok payment-history)
+    (ok (list))
+  )
+)
+
+(define-read-only (calculate-rent-due (rental-id uint))
+  (match (map-get? rental-agreements rental-id)
+    rental-data
+      (let
+        (
+          (current-time stacks-block-height)
+          (next-due (get next-payment-due rental-data))
+          (monthly-rent (get monthly-rent rental-data))
+          (late-fee (get late-fee rental-data))
+        )
+        (if (> current-time next-due)
+          (ok (+ monthly-rent late-fee))
+          (ok monthly-rent)
+        )
+      )
+    err-rental-not-found
+  )
+)
+
+(define-public (make-property-rentable 
+    (title-id uint)
+    (monthly-rent uint)
+    (security-deposit uint)
+    (rental-terms (string-ascii 256))
+  )
+  (let
+    ((title-data (unwrap! (map-get? title-registry title-id) err-not-found))
+     (title-owner (get owner title-data)))
+    
+    (asserts! (is-eq tx-sender title-owner) err-unauthorized)
+    (asserts! (> monthly-rent u0) err-invalid-amount)
+    
+    (map-set title-rental-status title-id {
+      is-rentable: true,
+      current-rental-id: none,
+      monthly-rent: monthly-rent,
+      security-deposit: security-deposit,
+      rental-terms: rental-terms
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (create-rental-agreement 
+    (title-id uint)
+    (tenant principal)
+    (duration-blocks uint)
+    (late-fee uint)
+  )
+  (let
+    (
+      (title-data (unwrap! (map-get? title-registry title-id) err-not-found))
+      (rental-status (unwrap! (map-get? title-rental-status title-id) err-property-not-rentable))
+      (rental-id (var-get next-rental-id))
+      (current-time stacks-block-height)
+      (end-date (+ current-time duration-blocks))
+      (monthly-rent (get monthly-rent rental-status))
+      (security-deposit (get security-deposit rental-status))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner title-data)) err-unauthorized)
+    (asserts! (get is-rentable rental-status) err-property-not-rentable)
+    (asserts! (is-none (get current-rental-id rental-status)) err-rental-exists)
+    
+    (map-set rental-agreements rental-id {
+      title-id: title-id,
+      landlord: tx-sender,
+      tenant: tenant,
+      monthly-rent: monthly-rent,
+      security-deposit: security-deposit,
+      start-date: current-time,
+      end-date: end-date,
+      next-payment-due: (+ current-time u4320),
+      status: "pending",
+      deposit-paid: false,
+      last-payment-date: u0,
+      total-paid: u0,
+      late-fee: late-fee
+    })
+    
+    (map-set landlord-rentals tx-sender
+      (unwrap-panic (as-max-len?
+        (append (default-to (list) (map-get? landlord-rentals tx-sender)) rental-id)
+        u20)))
+    
+    (map-set tenant-rentals tenant
+      (unwrap-panic (as-max-len?
+        (append (default-to (list) (map-get? tenant-rentals tenant)) rental-id)
+        u10)))
+    
+    (map-set title-rental-status title-id
+      (merge rental-status { current-rental-id: (some rental-id) }))
+    
+    (var-set next-rental-id (+ rental-id u1))
+    (ok rental-id)
+  )
+)
+
+(define-public (pay-security-deposit (rental-id uint))
+  (let
+    (
+      (rental-data (unwrap! (map-get? rental-agreements rental-id) err-rental-not-found))
+      (tenant (get tenant rental-data))
+      (deposit-amount (get security-deposit rental-data))
+      (landlord (get landlord rental-data))
+    )
+    
+    (asserts! (is-eq tx-sender tenant) err-not-tenant)
+    (asserts! (is-eq (get status rental-data) "pending") err-rental-not-active)
+    (asserts! (>= (stx-get-balance tx-sender) deposit-amount) err-deposit-insufficient)
+    
+    (try! (stx-transfer? deposit-amount tx-sender landlord))
+    
+    (map-set rental-agreements rental-id
+      (merge rental-data { 
+        deposit-paid: true,
+        status: "active"
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (pay-rent (rental-id uint))
+  (let
+    (
+      (rental-data (unwrap! (map-get? rental-agreements rental-id) err-rental-not-found))
+      (tenant (get tenant rental-data))
+      (landlord (get landlord rental-data))
+      (monthly-rent (get monthly-rent rental-data))
+      (late-fee (get late-fee rental-data))
+      (next-due (get next-payment-due rental-data))
+      (current-time stacks-block-height)
+      (is-late (> current-time next-due))
+      (payment-amount (if is-late (+ monthly-rent late-fee) monthly-rent))
+      (current-payments (default-to (list) (map-get? rental-payments rental-id)))
+    )
+    
+    (asserts! (is-eq tx-sender tenant) err-not-tenant)
+    (asserts! (is-eq (get status rental-data) "active") err-rental-not-active)
+    (asserts! (>= (stx-get-balance tx-sender) payment-amount) err-insufficient-funds)
+    
+    (try! (stx-transfer? payment-amount tx-sender landlord))
+    
+    (map-set rental-payments rental-id
+      (unwrap-panic (as-max-len?
+        (append current-payments {
+          payment-date: current-time,
+          amount: payment-amount,
+          payment-type: (if is-late "late-payment" "regular"),
+          period-start: current-time,
+          period-end: (+ current-time u4320)
+        })
+        u60)))
+    
+    (map-set rental-agreements rental-id
+      (merge rental-data {
+        next-payment-due: (+ current-time u4320),
+        last-payment-date: current-time,
+        total-paid: (+ (get total-paid rental-data) payment-amount)
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (terminate-rental (rental-id uint))
+  (let
+    (
+      (rental-data (unwrap! (map-get? rental-agreements rental-id) err-rental-not-found))
+      (landlord (get landlord rental-data))
+      (tenant (get tenant rental-data))
+      (title-id (get title-id rental-data))
+    )
+    
+    (asserts! (or (is-eq tx-sender landlord) (is-eq tx-sender tenant)) err-unauthorized)
+    (asserts! (is-eq (get status rental-data) "active") err-rental-not-active)
+    
+    (map-set rental-agreements rental-id
+      (merge rental-data { status: "terminated" }))
+    
+    (match (map-get? title-rental-status title-id)
+      rental-status
+        (map-set title-rental-status title-id
+          (merge rental-status { current-rental-id: none }))
+      true)
+    
+    (ok true)
+  )
+)
+
+(define-public (evict-tenant (rental-id uint))
+  (let
+    (
+      (rental-data (unwrap! (map-get? rental-agreements rental-id) err-rental-not-found))
+      (landlord (get landlord rental-data))
+      (next-due (get next-payment-due rental-data))
+      (current-time stacks-block-height)
+      (title-id (get title-id rental-data))
+    )
+    
+    (asserts! (is-eq tx-sender landlord) err-unauthorized)
+    (asserts! (is-eq (get status rental-data) "active") err-rental-not-active)
+    (asserts! (> current-time (+ next-due u1440)) err-rent-overdue)
+    
+    (map-set rental-agreements rental-id
+      (merge rental-data { status: "evicted" }))
+    
+    (match (map-get? title-rental-status title-id)
+      rental-status
+        (map-set title-rental-status title-id
+          (merge rental-status { current-rental-id: none }))
+      true)
+    
+    (ok true)
+  )
+)
+
+(define-public (extend-rental 
+    (rental-id uint)
+    (additional-blocks uint)
+  )
+  (let
+    (
+      (rental-data (unwrap! (map-get? rental-agreements rental-id) err-rental-not-found))
+      (landlord (get landlord rental-data))
+      (tenant (get tenant rental-data))
+      (current-end-date (get end-date rental-data))
+    )
+    
+    (asserts! (or (is-eq tx-sender landlord) (is-eq tx-sender tenant)) err-unauthorized)
+    (asserts! (is-eq (get status rental-data) "active") err-rental-not-active)
+    
+    (map-set rental-agreements rental-id
+      (merge rental-data { 
+        end-date: (+ current-end-date additional-blocks)
+      }))
+    
+    (ok true)
   )
 )
