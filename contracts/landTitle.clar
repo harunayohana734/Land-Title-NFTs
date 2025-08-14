@@ -943,3 +943,384 @@
     (ok true)
   )
 )
+
+;; === PROPERTY ASSESSMENT & VALUATION SYSTEM ===
+;; Enables certified appraisers to submit property valuations with historical tracking
+
+;; Error constants for valuation system
+(define-constant err-appraiser-not-certified (err u401))
+(define-constant err-valuation-not-found (err u402))
+(define-constant err-valuation-exists (err u403))
+(define-constant err-invalid-valuation (err u404))
+(define-constant err-valuation-expired (err u405))
+(define-constant err-appraiser-exists (err u406))
+(define-constant err-insufficient-experience (err u407))
+(define-constant err-valuation-disputed (err u408))
+
+;; Data variables for valuation system
+(define-data-var next-valuation-id uint u1)
+(define-data-var next-appraiser-id uint u1)
+
+;; Map for certified appraisers
+(define-map certified-appraisers
+  principal
+  {
+    appraiser-id: uint,
+    name: (string-ascii 64),
+    license-number: (string-ascii 32),
+    certification-date: uint,
+    expiry-date: uint,
+    experience-years: uint,
+    specializations: (list 5 (string-ascii 32)),
+    total-valuations: uint,
+    average-rating: uint,
+    is-active: bool
+  }
+)
+
+;; Map for property valuations
+(define-map property-valuations
+  uint
+  {
+    title-id: uint,
+    appraiser: principal,
+    valuation-amount: uint,
+    valuation-date: uint,
+    expiry-date: uint,
+    methodology: (string-ascii 64),
+    property-condition: (string-ascii 32),
+    market-factors: (string-ascii 256),
+    comparable-sales: (list 3 uint),
+    confidence-level: uint,
+    purpose: (string-ascii 64),
+    status: (string-ascii 16),
+    notes: (string-ascii 512)
+  }
+)
+
+;; Map for tracking valuations by title
+(define-map title-valuations
+  uint
+  (list 20 uint)
+)
+
+;; Map for tracking appraiser valuations
+(define-map appraiser-valuations
+  principal
+  (list 100 uint)
+)
+
+;; Map for valuation disputes
+(define-map valuation-disputes
+  uint
+  {
+    disputing-party: principal,
+    dispute-reason: (string-ascii 256),
+    dispute-date: uint,
+    resolution-status: (string-ascii 16),
+    resolved-by: (optional principal),
+    resolution-date: (optional uint),
+    new-valuation: (optional uint)
+  }
+)
+
+;; Map for market trends by jurisdiction
+(define-map market-trends
+  (string-ascii 64)
+  {
+    average-value-per-sqft: uint,
+    trend-direction: (string-ascii 16),
+    last-update: uint,
+    sample-size: uint,
+    period-start: uint,
+    period-end: uint
+  }
+)
+
+;; Read-only functions for valuation system
+(define-read-only (get-appraiser-details (appraiser principal))
+  (match (map-get? certified-appraisers appraiser)
+    appraiser-data (ok appraiser-data)
+    err-appraiser-not-certified
+  )
+)
+
+(define-read-only (get-valuation-details (valuation-id uint))
+  (match (map-get? property-valuations valuation-id)
+    valuation-data (ok valuation-data)
+    err-valuation-not-found
+  )
+)
+
+(define-read-only (get-title-valuations (title-id uint))
+  (match (map-get? title-valuations title-id)
+    valuation-list (ok valuation-list)
+    (ok (list))
+  )
+)
+
+(define-read-only (get-appraiser-valuations (appraiser principal))
+  (match (map-get? appraiser-valuations appraiser)
+    valuation-list (ok valuation-list)
+    (ok (list))
+  )
+)
+
+(define-read-only (get-current-market-value (title-id uint))
+  (let
+    ((valuations (default-to (list) (map-get? title-valuations title-id))))
+    (if (> (len valuations) u0)
+      (match (map-get? property-valuations (unwrap-panic (element-at valuations (- (len valuations) u1))))
+        latest-valuation
+          (if (< stacks-block-height (get expiry-date latest-valuation))
+            (ok (get valuation-amount latest-valuation))
+            err-valuation-expired)
+        err-valuation-not-found)
+      err-valuation-not-found
+    )
+  )
+)
+
+(define-read-only (calculate-average-valuation (title-id uint) (period-blocks uint))
+  (let
+    (
+      (valuations (default-to (list) (map-get? title-valuations title-id)))
+      (cutoff-date (- stacks-block-height period-blocks))
+    )
+    (if (> (len valuations) u0)
+      (fold calculate-valuation-average valuations { total: u0, count: u0, cutoff: cutoff-date })
+      { total: u0, count: u0, cutoff: cutoff-date }
+    )
+  )
+)
+
+(define-read-only (get-market-trends (jurisdiction (string-ascii 64)))
+  (match (map-get? market-trends jurisdiction)
+    trend-data (ok trend-data)
+    (ok {
+      average-value-per-sqft: u0,
+      trend-direction: "stable",
+      last-update: u0,
+      sample-size: u0,
+      period-start: u0,
+      period-end: u0
+    })
+  )
+)
+
+;; Private helper function for valuation averaging
+(define-private (calculate-valuation-average 
+    (valuation-id uint) 
+    (acc { total: uint, count: uint, cutoff: uint })
+  )
+  (match (map-get? property-valuations valuation-id)
+    valuation-data
+      (if (>= (get valuation-date valuation-data) (get cutoff acc))
+        {
+          total: (+ (get total acc) (get valuation-amount valuation-data)),
+          count: (+ (get count acc) u1),
+          cutoff: (get cutoff acc)
+        }
+        acc)
+    acc
+  )
+)
+
+;; Public functions for valuation system
+(define-public (register-appraiser 
+    (appraiser principal)
+    (name (string-ascii 64))
+    (license-number (string-ascii 32))
+    (experience-years uint)
+    (specializations (list 5 (string-ascii 32)))
+    (certification-duration-blocks uint)
+  )
+  (let
+    (
+      (appraiser-id (var-get next-appraiser-id))
+      (current-time stacks-block-height)
+      (expiry-time (+ current-time certification-duration-blocks))
+    )
+    
+    (asserts! (is-verification-authority tx-sender) err-unauthorized)
+    (asserts! (>= experience-years u2) err-insufficient-experience)
+    (asserts! (is-none (map-get? certified-appraisers appraiser)) err-appraiser-exists)
+    
+    (map-set certified-appraisers appraiser {
+      appraiser-id: appraiser-id,
+      name: name,
+      license-number: license-number,
+      certification-date: current-time,
+      expiry-date: expiry-time,
+      experience-years: experience-years,
+      specializations: specializations,
+      total-valuations: u0,
+      average-rating: u0,
+      is-active: true
+    })
+    
+    (var-set next-appraiser-id (+ appraiser-id u1))
+    (ok appraiser-id)
+  )
+)
+
+(define-public (submit-property-valuation 
+    (title-id uint)
+    (valuation-amount uint)
+    (methodology (string-ascii 64))
+    (property-condition (string-ascii 32))
+    (market-factors (string-ascii 256))
+    (comparable-sales (list 3 uint))
+    (confidence-level uint)
+    (purpose (string-ascii 64))
+    (valuation-duration-blocks uint)
+    (notes (string-ascii 512))
+  )
+  (let
+    (
+      (valuation-id (var-get next-valuation-id))
+      (current-time stacks-block-height)
+      (expiry-time (+ current-time valuation-duration-blocks))
+      (appraiser-data (unwrap! (map-get? certified-appraisers tx-sender) err-appraiser-not-certified))
+      (current-valuations (default-to (list) (map-get? title-valuations title-id)))
+      (appraiser-valuations-list (default-to (list) (map-get? appraiser-valuations tx-sender)))
+    )
+    
+    (asserts! (is-some (map-get? title-registry title-id)) err-not-found)
+    (asserts! (get is-active appraiser-data) err-appraiser-not-certified)
+    (asserts! (> (get expiry-date appraiser-data) current-time) err-appraiser-not-certified)
+    (asserts! (> valuation-amount u0) err-invalid-valuation)
+    (asserts! (and (>= confidence-level u1) (<= confidence-level u10)) err-invalid-valuation)
+    
+    (map-set property-valuations valuation-id {
+      title-id: title-id,
+      appraiser: tx-sender,
+      valuation-amount: valuation-amount,
+      valuation-date: current-time,
+      expiry-date: expiry-time,
+      methodology: methodology,
+      property-condition: property-condition,
+      market-factors: market-factors,
+      comparable-sales: comparable-sales,
+      confidence-level: confidence-level,
+      purpose: purpose,
+      status: "active",
+      notes: notes
+    })
+    
+    (map-set title-valuations title-id
+      (unwrap-panic (as-max-len?
+        (append current-valuations valuation-id)
+        u20)))
+    
+    (map-set appraiser-valuations tx-sender
+      (unwrap-panic (as-max-len?
+        (append appraiser-valuations-list valuation-id)
+        u100)))
+    
+    ;; Update appraiser stats
+    (map-set certified-appraisers tx-sender
+      (merge appraiser-data { 
+        total-valuations: (+ (get total-valuations appraiser-data) u1)
+      }))
+    
+    (var-set next-valuation-id (+ valuation-id u1))
+    (ok valuation-id)
+  )
+)
+
+(define-public (dispute-valuation 
+    (valuation-id uint)
+    (dispute-reason (string-ascii 256))
+  )
+  (let
+    (
+      (valuation-data (unwrap! (map-get? property-valuations valuation-id) err-valuation-not-found))
+      (title-id (get title-id valuation-data))
+      (title-data (unwrap! (map-get? title-registry title-id) err-not-found))
+    )
+    
+    (asserts! (is-eq tx-sender (get owner title-data)) err-unauthorized)
+    (asserts! (is-eq (get status valuation-data) "active") err-valuation-disputed)
+    
+    (map-set valuation-disputes valuation-id {
+      disputing-party: tx-sender,
+      dispute-reason: dispute-reason,
+      dispute-date: stacks-block-height,
+      resolution-status: "pending",
+      resolved-by: none,
+      resolution-date: none,
+      new-valuation: none
+    })
+    
+    (map-set property-valuations valuation-id
+      (merge valuation-data { status: "disputed" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-valuation-dispute 
+    (valuation-id uint)
+    (uphold-valuation bool)
+    (new-valuation-amount (optional uint))
+  )
+  (let
+    (
+      (dispute-data (unwrap! (map-get? valuation-disputes valuation-id) err-valuation-not-found))
+      (valuation-data (unwrap! (map-get? property-valuations valuation-id) err-valuation-not-found))
+    )
+    
+    (asserts! (is-verification-authority tx-sender) err-unauthorized)
+    (asserts! (is-eq (get resolution-status dispute-data) "pending") err-valuation-disputed)
+    
+    (if uphold-valuation
+      (map-set property-valuations valuation-id
+        (merge valuation-data { status: "active" }))
+      (match new-valuation-amount
+        new-amount
+          (map-set property-valuations valuation-id
+            (merge valuation-data { 
+              status: "revised",
+              valuation-amount: new-amount
+            }))
+        (map-set property-valuations valuation-id
+          (merge valuation-data { status: "rejected" }))))
+    
+    (map-set valuation-disputes valuation-id
+      (merge dispute-data {
+        resolution-status: "resolved",
+        resolved-by: (some tx-sender),
+        resolution-date: (some stacks-block-height),
+        new-valuation: new-valuation-amount
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (update-market-trends 
+    (jurisdiction (string-ascii 64))
+    (average-value-per-sqft uint)
+    (trend-direction (string-ascii 16))
+    (sample-size uint)
+    (period-blocks uint)
+  )
+  (let
+    ((current-time stacks-block-height))
+    
+    (asserts! (is-verification-authority tx-sender) err-unauthorized)
+    (asserts! (> sample-size u0) err-invalid-valuation)
+    
+    (map-set market-trends jurisdiction {
+      average-value-per-sqft: average-value-per-sqft,
+      trend-direction: trend-direction,
+      last-update: current-time,
+      sample-size: sample-size,
+      period-start: (- current-time period-blocks),
+      period-end: current-time
+    })
+    
+    (ok true)
+  )
+)
